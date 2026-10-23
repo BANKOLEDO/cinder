@@ -154,10 +154,11 @@
   if (generate) {
     generate.addEventListener("click", () => {
       const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+      const limit = 256 - (256 % alphabet.length);
       const pick = () => {
         const buf = new Uint8Array(1);
         let n = 256;
-        while (n >= 248) {
+        while (n >= limit) {
           crypto.getRandomValues(buf);
           n = buf[0];
         }
@@ -190,6 +191,28 @@
     };
     ttlInputs.forEach((el) => el.addEventListener("change", paint));
     paint();
+  }
+
+  /* ---------- read limit preview ---------- */
+
+  const readsInputs = $$('input[name="reads"]');
+  const readsPreview = $("[data-reads-preview]");
+  if (readsInputs.length && readsPreview) {
+    const readsMeta = $("[data-reads-meta]");
+    const readsSummary = $("[data-reads-summary]");
+    const readsChip = $("[data-reads-chip]");
+    const paintReads = () => {
+      const selected = readsInputs.find((el) => el.checked);
+      const count = selected ? Number(selected.value) : 1;
+      const label = count === 1 ? "1 read" : count + " reads";
+      const allowed = count === 1 ? "1 allowed" : count + " allowed";
+      readsPreview.textContent = label;
+      if (readsMeta) readsMeta.textContent = label;
+      if (readsSummary) readsSummary.textContent = allowed;
+      if (readsChip) readsChip.textContent = label;
+    };
+    readsInputs.forEach((el) => el.addEventListener("change", paintReads));
+    paintReads();
   }
 
   /* ---------- show / hide passphrase ---------- */
@@ -268,6 +291,7 @@
     add("Show or hide the passphrase", "Read", () => { const el = $("[data-toggle-pw]"); if (el) el.click(); });
   }
   add("New note", "Navigate", () => { window.location.href = "/"; });
+  add("Your notes", "Navigate", () => { window.location.href = "/history"; });
   add("Security model", "Navigate", () => { window.location.href = "/security"; });
 
   let filtered = [];
