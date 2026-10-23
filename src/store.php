@@ -25,10 +25,20 @@ function db(): PDO
             ciphertext BLOB NOT NULL,
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
+            max_reads INTEGER NOT NULL DEFAULT 1,
+            read_count INTEGER NOT NULL DEFAULT 0,
             fail_count INTEGER NOT NULL DEFAULT 0,
             locked_until INTEGER NOT NULL DEFAULT 0
         )'
     );
+    $columns = $pdo->query('PRAGMA table_info(notes)')->fetchAll();
+    $names = array_column($columns, 'name');
+    if (!in_array('max_reads', $names, true)) {
+        $pdo->exec('ALTER TABLE notes ADD COLUMN max_reads INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!in_array('read_count', $names, true)) {
+        $pdo->exec('ALTER TABLE notes ADD COLUMN read_count INTEGER NOT NULL DEFAULT 0');
+    }
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_notes_expires ON notes(expires_at)');
     $pdo->exec(
         'CREATE TABLE IF NOT EXISTS rate_limits (
@@ -92,8 +102,9 @@ function derive_note_key(string $password, string $salt): string
     );
 }
 
-function create_note(string $body, string $password, int $ttl): string
+function create_note(string $body, string $password, int $ttl, int $reads = 1): string
 {
+    $reads = max(1, min(10, $reads));
     $salt = random_bytes(SODIUM_CRYPTO_PWHASH_SALTBYTES);
     $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
     $key = derive_note_key($password, $salt);
@@ -109,9 +120,9 @@ function create_note(string $body, string $password, int $ttl): string
         $id = rtrim(strtr(base64_encode(random_bytes(12)), '+/', '-_'), '=');
         try {
             $pdo->prepare(
-                'INSERT INTO notes (id, salt, nonce, ciphertext, created_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?)'
-            )->execute([$id, $salt, $nonce, $ciphertext, $now, $now + $ttl]);
+                'INSERT INTO notes (id, salt, nonce, ciphertext, created_at, expires_at, max_reads)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)'
+            )->execute([$id, $salt, $nonce, $ciphertext, $now, $now + $ttl, $reads]);
             return $id;
         } catch (PDOException $error) {
             if ($error->getCode() !== '23000') {
@@ -127,6 +138,14 @@ function note_available(string $id): bool
     $statement = db()->prepare('SELECT 1 FROM notes WHERE id = ? AND expires_at > ?');
     $statement->execute([$id, time()]);
     return $statement->fetchColumn() !== false;
+}
+
+function note_read_limit(string $id): int
+{
+    $statement = db()->prepare('SELECT max_reads FROM notes WHERE id = ? AND expires_at > ?');
+    $statement->execute([$id, time()]);
+    $reads = $statement->fetchColumn();
+    return is_int($reads) || is_numeric($reads) ? max(1, min(10, (int) $reads)) : 1;
 }
 
 function reveal_note(string $id, string $password): array
@@ -165,9 +184,24 @@ function reveal_note(string $id, string $password): array
             return ['status' => 'bad'];
         }
 
-        $pdo->prepare('DELETE FROM notes WHERE id = ?')->execute([$id]);
+        $limit = max(1, (int) $note['max_reads']);
+        $used = (int) $note['read_count'] + 1;
+        $remaining = max(0, $limit - $used);
+
+        if ($remaining === 0) {
+            $pdo->prepare('DELETE FROM notes WHERE id = ?')->execute([$id]);
+        } else {
+            $pdo->prepare(
+                'UPDATE notes SET read_count = ?, fail_count = 0, locked_until = 0 WHERE id = ?'
+            )->execute([$used, $id]);
+        }
         $pdo->exec('COMMIT');
-        return ['status' => 'ok', 'body' => $plain];
+        return [
+            'status' => 'ok',
+            'body' => $plain,
+            'remaining' => $remaining,
+            'max_reads' => $limit,
+        ];
     } catch (Throwable $error) {
         $pdo->exec('ROLLBACK');
         throw $error;
