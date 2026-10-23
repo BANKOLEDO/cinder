@@ -14,6 +14,7 @@ const NOTE_MAX_BYTES = 32768;
 const PASSWORD_MIN = 10;
 const PASSWORD_MAX = 1024;
 const NOTE_TTLS = [3600 => '1 hour', 86400 => '1 day', 604800 => '7 days', 2592000 => '30 days'];
+const NOTE_READS = [1 => '1 read', 2 => '2 reads', 3 => '3 reads', 5 => '5 reads', 10 => '10 reads'];
 const ARGON_OPS = 3;
 const ARGON_MEM = 33554432;
 const FAIL_LIMIT = 5;
@@ -39,9 +40,22 @@ set_exception_handler(static function (Throwable $e): void {
     ));
     if (!headers_sent()) {
         http_response_code(500);
+        header_remove('X-Powered-By');
         header('Content-Type: text/html; charset=utf-8');
         header('Cache-Control: no-store');
-        header("Content-Security-Policy: default-src 'none'; style-src 'self'; font-src 'self'");
+        header('X-Content-Type-Options: nosniff');
+        header('Referrer-Policy: no-referrer');
+        header('X-Frame-Options: DENY');
+        header('Cross-Origin-Opener-Policy: same-origin');
+        header('Cross-Origin-Resource-Policy: same-origin');
+        header(
+            "Content-Security-Policy: default-src 'none'; style-src 'self'; font-src 'self'; "
+            . "img-src 'self'; manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+            . "form-action 'none'; object-src 'none'"
+        );
+        if (is_https()) {
+            header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+        }
     }
     echo '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         . '<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -65,6 +79,45 @@ function is_https(): bool
         || getenv('APP_HTTPS') === '1';
 }
 
+function site_host(): string
+{
+    $host = $_SERVER['HTTP_HOST'] ?? '';
+    if (!is_string($host)
+        || preg_match('/\A[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?(?::\d{1,5})?\z/', $host) !== 1
+    ) {
+        return 'localhost';
+    }
+    return strtolower($host);
+}
+
+function site_origin(): string
+{
+    $configured = getenv('APP_URL');
+    if (is_string($configured) && $configured !== '') {
+        $parts = parse_url($configured);
+        if (is_array($parts)
+            && isset($parts['scheme'], $parts['host'])
+            && in_array(strtolower($parts['scheme']), ['http', 'https'], true)
+            && preg_match('/\A[A-Za-z0-9](?:[A-Za-z0-9.\-]*[A-Za-z0-9])?\z/', $parts['host']) === 1
+            && !isset($parts['user'], $parts['pass'], $parts['query'], $parts['fragment'])
+            && (!isset($parts['path']) || $parts['path'] === '' || $parts['path'] === '/')
+            && (!isset($parts['port']) || ((int) $parts['port'] > 0 && (int) $parts['port'] < 65536))
+        ) {
+            return strtolower($parts['scheme']) . '://' . strtolower($parts['host'])
+                . (isset($parts['port']) ? ':' . (int) $parts['port'] : '');
+        }
+    }
+    return (is_https() ? 'https' : 'http') . '://' . site_host();
+}
+
+function site_url(string $path = '/'): string
+{
+    if ($path === '' || $path[0] !== '/') {
+        $path = '/' . $path;
+    }
+    return site_origin() . $path;
+}
+
 function start_session(): void
 {
     if (session_status() === PHP_SESSION_ACTIVE) {
@@ -72,6 +125,7 @@ function start_session(): void
     }
     ini_set('session.use_strict_mode', '1');
     ini_set('session.use_only_cookies', '1');
+    ini_set('session.use_trans_sid', '0');
     ini_set('session.cookie_httponly', '1');
     ini_set('session.cookie_samesite', 'Strict');
     session_set_cookie_params([
@@ -100,11 +154,10 @@ function security_headers(string $contentType = 'text/html; charset=utf-8'): voi
     header('Cross-Origin-Opener-Policy: same-origin');
     header('Cross-Origin-Resource-Policy: same-origin');
     header('Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()');
-    header('X-Robots-Tag: noindex, nofollow, noarchive');
     header(
         "Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; "
         . "img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'self'; "
-        . "base-uri 'none'; frame-ancestors 'none'; object-src 'none'"
+        . "manifest-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'"
     );
     if (is_https()) {
         header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
@@ -161,6 +214,7 @@ function app_secret(): string
         if (!is_string($raw) || strlen($raw) !== 32) {
             throw new RuntimeException('Invalid application key.');
         }
+        @chmod($path, 0600);
         return $secret = $raw;
     }
     $raw = random_bytes(32);
@@ -192,6 +246,43 @@ function valid_note_id(string $id): bool
 {
     return preg_match('/\A[A-Za-z0-9_-]{16}\z/', $id) === 1;
 }
+
+function created_history(): array
+{
+    if (!isset($_SESSION['created']) || !is_array($_SESSION['created'])) {
+        return [];
+    }
+    $now = time();
+    $expiries = (isset($_SESSION['expires']) && is_array($_SESSION['expires'])) ? $_SESSION['expires'] : [];
+    $readLimits = (isset($_SESSION['reads']) && is_array($_SESSION['reads'])) ? $_SESSION['reads'] : [];
+    $notes = [];
+    foreach ($_SESSION['created'] as $id => $created) {
+        if (!is_string($id) || !valid_note_id($id) || !is_int($created)
+            || $created > $now + 60 || $now - $created > 3600
+        ) {
+            unset($_SESSION['created'][$id]);
+            unset($expiries[$id], $readLimits[$id]);
+            continue;
+        }
+        $expires = $expiries[$id] ?? null;
+        $reads = $readLimits[$id] ?? null;
+        $notes[$id] = [
+            'created' => $created,
+            'expires' => is_int($expires) && $expires > $created ? $expires : $created + 3600,
+            'reads' => is_int($reads) && $reads > 0 && $reads <= 10 ? $reads : 1,
+        ];
+    }
+    $_SESSION['expires'] = $expiries;
+    $_SESSION['reads'] = $readLimits;
+    uasort($notes, static fn (array $a, array $b): int => $b['created'] <=> $a['created']);
+    return $notes;
+}
+
+function created_allowed(string $id): bool
+{
+    return isset(created_history()[$id]);
+}
+
 
 function php_runtime_patched(): bool
 {
