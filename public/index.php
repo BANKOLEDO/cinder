@@ -41,16 +41,21 @@ function handle_create(): void
     $body = $_POST['body'] ?? '';
     $password = $_POST['password'] ?? '';
     $ttlRaw = $_POST['ttl'] ?? '';
+    $readsRaw = $_POST['reads'] ?? '1';
 
     if (!is_string($body) || !is_string($password) || !is_string($ttlRaw)
+        || !is_string($readsRaw)
         || preg_match('/\A\d+\z/', $ttlRaw) !== 1
         || !isset(NOTE_TTLS[(int) $ttlRaw])
+        || preg_match('/\A\d+\z/', $readsRaw) !== 1
+        || !isset(NOTE_READS[(int) $readsRaw])
     ) {
-        view_error(422, 'Check the form', 'Choose a valid expiry and try again.');
+        view_error(422, 'Check the form', 'Choose a valid expiry and read limit, then try again.');
         return;
     }
 
     $ttl = (int) $ttlRaw;
+    $reads = (int) $readsRaw;
 
     if (trim($body) === '') {
         view_error(422, 'Nothing to seal', 'Write something in the note first.');
@@ -71,10 +76,17 @@ function handle_create(): void
     }
 
     gc_notes();
-    $id = create_note($body, $password, $ttl);
+    $id = create_note($body, $password, $ttl, $reads);
     $_SESSION['created'] = is_array($_SESSION['created'] ?? null) ? $_SESSION['created'] : [];
     $_SESSION['created'][$id] = time();
     $_SESSION['expires'][$id] = time() + $ttl;
+    $_SESSION['reads'][$id] = $reads;
+    $history = created_history();
+    if (count($history) > 25) {
+        foreach (array_slice(array_keys($history), 25) as $old) {
+            unset($_SESSION['created'][$old], $_SESSION['expires'][$old], $_SESSION['reads'][$old]);
+        }
+    }
     redirect('/created/' . $id);
 }
 
@@ -88,7 +100,7 @@ function handle_reveal(string $id): void
     $password = $_POST['password'] ?? '';
     if (!is_string($password) || $password === '' || strlen($password) > PASSWORD_MAX) {
         http_response_code(422);
-        view_reveal($id, 'Enter the password for this note.');
+        view_reveal($id, 'Enter the password for this note.', note_read_limit($id));
         return;
     }
 
@@ -100,28 +112,81 @@ function handle_reveal(string $id): void
     $result = reveal_note($id, $password);
 
     if ($result['status'] === 'ok') {
-        view_note($result['body']);
+        view_note($result['body'], (int) $result['remaining']);
         return;
     }
     if ($result['status'] === 'bad') {
-        view_reveal($id, 'That password did not work.');
+        view_reveal($id, 'That password did not work.', note_read_limit($id));
         return;
     }
     view_error(404, 'Gone', 'This note no longer exists. It expired, was read, or never did.');
 }
 
-function created_allowed(string $id): bool
+function handle_history_clear(): void
 {
-    if (!isset($_SESSION['created']) || !is_array($_SESSION['created'])) {
-        return false;
+    if (!csrf_valid($_POST['csrf'] ?? null)) {
+        view_error(403, 'Request rejected', 'Your session expired or the form was tampered with. Reload and try again.');
+        return;
     }
-    $now = time();
-    foreach ($_SESSION['created'] as $key => $timestamp) {
-        if (!is_int($timestamp) || $now - $timestamp > 3600) {
-            unset($_SESSION['created'][$key]);
-        }
+    if (($_POST['action'] ?? '') !== 'clear') {
+        view_error(422, 'Nothing to clear', 'That request did not name an action.');
+        return;
     }
-    return isset($_SESSION['created'][$id]);
+    unset($_SESSION['created'], $_SESSION['expires'], $_SESSION['reads']);
+    redirect('/history');
+}
+
+function handle_robots(): void
+{
+    security_headers('text/plain; charset=utf-8');
+    header('Cache-Control: public, max-age=3600');
+    header('Vary: Host');
+    header_remove('Pragma');
+    echo "User-agent: *\n"
+        . "Allow: /\n"
+        . "Disallow: /note/\n"
+        . "Disallow: /created/\n"
+        . "Disallow: /history\n\n"
+        . 'Sitemap: ' . site_url('/sitemap.xml') . "\n";
+}
+
+function handle_sitemap(): void
+{
+    security_headers('application/xml; charset=utf-8');
+    header('Cache-Control: public, max-age=3600');
+    header('Vary: Host');
+    header_remove('Pragma');
+    echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n"
+        . '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">';
+    foreach ([site_url('/'), site_url('/security')] as $url) {
+        echo '<url><loc>' . e($url) . '</loc></url>';
+    }
+    echo '</urlset>' . "\n";
+}
+
+function handle_manifest(): void
+{
+    security_headers('application/manifest+json; charset=utf-8');
+    header('Cache-Control: public, max-age=86400');
+    header('Vary: Host');
+    header_remove('Pragma');
+    $manifest = [
+        'id' => '/',
+        'name' => APP_NAME . ' - encrypted notes that disappear',
+        'short_name' => APP_NAME,
+        'description' => 'Encrypt a note with a passphrase and a read limit. The link deletes itself after the last read.',
+        'start_url' => '/',
+        'scope' => '/',
+        'display' => 'standalone',
+        'background_color' => '#0a0a0a',
+        'theme_color' => '#0a0a0a',
+        'icons' => [
+            ['src' => '/assets/icon-192.png', 'sizes' => '192x192', 'type' => 'image/png', 'purpose' => 'any'],
+            ['src' => '/assets/icon-512.png', 'sizes' => '512x512', 'type' => 'image/png', 'purpose' => 'any'],
+            ['src' => '/assets/icon-512.png', 'sizes' => '512x512', 'type' => 'image/png', 'purpose' => 'maskable'],
+        ],
+    ];
+    echo json_encode($manifest, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT) . "\n";
 }
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -151,8 +216,33 @@ if ($method === 'GET' && $path === '/security') {
     exit;
 }
 
+if ($method === 'GET' && $path === '/history') {
+    view_history(created_history());
+    exit;
+}
+
+if ($method === 'POST' && $path === '/history') {
+    handle_history_clear();
+    exit;
+}
+
 if ($method === 'POST' && $path === '/create') {
     handle_create();
+    exit;
+}
+
+if ($method === 'GET' && $path === '/robots.txt') {
+    handle_robots();
+    exit;
+}
+
+if ($method === 'GET' && $path === '/sitemap.xml') {
+    handle_sitemap();
+    exit;
+}
+
+if ($method === 'GET' && $path === '/site.webmanifest') {
+    handle_manifest();
     exit;
 }
 
@@ -179,7 +269,8 @@ if (preg_match('#\A/created/([A-Za-z0-9_-]{16})\z#', $path, $matches) === 1) {
         exit;
     }
     $expires = $_SESSION['expires'][$matches[1]] ?? null;
-    view_created($matches[1], is_int($expires) ? $expires : null);
+    $reads = $_SESSION['reads'][$matches[1]] ?? 1;
+    view_created($matches[1], is_int($expires) ? $expires : null, is_int($reads) ? $reads : 1);
     exit;
 }
 
@@ -193,7 +284,7 @@ if (preg_match('#\A/note/([A-Za-z0-9_-]{16})\z#', $path, $matches) === 1) {
             view_error(404, 'Gone', 'This note no longer exists. It expired, was read, or never did.');
             exit;
         }
-        view_reveal($id);
+        view_reveal($id, null, note_read_limit($id));
         exit;
     }
     if ($method === 'POST') {
